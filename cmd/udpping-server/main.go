@@ -15,8 +15,10 @@ import (
 )
 
 var (
-	port           = flag.Int("port", 9999, "UDP port to listen on")
-	reportInterval = flag.Duration("report", 10*time.Second, "Statistics report interval")
+	port             = flag.Int("port", 9999, "UDP port to listen on")
+	reportInterval   = flag.Duration("report", 10*time.Second, "Statistics report interval")
+	feedbackInterval = flag.Duration("feedback", 1*time.Minute, "Per-client feedback interval")
+	inactiveTimeout  = flag.Duration("timeout", 5*time.Minute, "Client inactive timeout")
 )
 
 func main() {
@@ -30,32 +32,68 @@ func main() {
 	defer conn.Close()
 
 	log.Printf("UDP Ping Server listening on %s", addr)
+	log.Printf("Per-client feedback interval: %v", *feedbackInterval)
+	log.Printf("Client inactive timeout: %v", *inactiveTimeout)
 
-	statistics := stats.NewStatistics()
+	clientManager := stats.NewClientManager(*feedbackInterval, *inactiveTimeout)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		ticker := time.NewTicker(*reportInterval)
-		defer ticker.Stop()
+		reportTicker := time.NewTicker(*reportInterval)
+		defer reportTicker.Stop()
+
+		cleanupTicker := time.NewTicker(1 * time.Minute)
+		defer cleanupTicker.Stop()
 
 		for {
 			select {
-			case <-ticker.C:
-				log.Println(statistics.Report())
+			case <-reportTicker.C:
+				log.Println(clientManager.GetReport())
+			case <-cleanupTicker.C:
+				if removed := clientManager.CleanupInactiveClients(); removed > 0 {
+					log.Printf("Cleaned up %d inactive client(s)", removed)
+				}
 			case <-sigChan:
 				log.Println("\nShutting down...")
 				log.Println("Final Statistics:")
-				log.Println(statistics.Report())
+				log.Println(clientManager.GetReport())
 				os.Exit(0)
 			}
 		}
 	}()
 
 	buffer := make([]byte, 1024)
-	clientAddrs := make(map[string]*net.UDPAddr)
-	lastFeedbackTime := time.Now()
+
+	go func() {
+		feedbackTicker := time.NewTicker(10 * time.Second)
+		defer feedbackTicker.Stop()
+
+		for range feedbackTicker.C {
+			for _, client := range clientManager.GetAllClients() {
+				if client.ShouldSendFeedback(*feedbackInterval) {
+					sent, received, lossRate := client.Statistics.GetStats()
+					feedback := protocol.NewFeedbackPacket(received)
+
+					udpAddr, err := net.ResolveUDPAddr("udp", client.Address)
+					if err != nil {
+						log.Printf("Error resolving address %s: %v", client.Address, err)
+						continue
+					}
+
+					_, err = conn.WriteTo(feedback.Marshal(), udpAddr)
+					if err != nil {
+						log.Printf("Error sending feedback to %s: %v", client.Address, err)
+					} else {
+						log.Printf("Sent feedback to %s: sent=%d, received=%d, loss=%.2f%%",
+							client.Address, sent, received, lossRate)
+						client.UpdateFeedbackTime()
+					}
+				}
+			}
+		}
+	}()
 
 	for {
 		n, clientAddr, err := conn.ReadFrom(buffer)
@@ -71,28 +109,10 @@ func main() {
 		}
 
 		if packet.Type == protocol.PacketTypeProbe {
-			statistics.IncrementReceived(packet.Sequence)
-
-			udpAddr, ok := clientAddr.(*net.UDPAddr)
-			if ok {
-				clientAddrs[clientAddr.String()] = udpAddr
-			}
-
-			if time.Since(lastFeedbackTime) >= *reportInterval {
-				for _, addr := range clientAddrs {
-					sent, received, lossRate := statistics.GetStats()
-					feedback := protocol.NewFeedbackPacket(received)
-					
-					_, err := conn.WriteTo(feedback.Marshal(), addr)
-					if err != nil {
-						log.Printf("Error sending feedback to %s: %v", addr, err)
-					} else {
-						log.Printf("Sent feedback to %s: sent=%d, received=%d, loss=%.2f%%", 
-							addr, sent, received, lossRate)
-					}
-				}
-				lastFeedbackTime = time.Now()
-			}
+			clientAddrStr := clientAddr.String()
+			client := clientManager.GetOrCreateClient(clientAddrStr)
+			client.Statistics.IncrementReceived(packet.Sequence)
+			client.UpdateLastPacketTime()
 		}
 	}
 }
